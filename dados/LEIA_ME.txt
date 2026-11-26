@@ -1,0 +1,3 @@
+Coloque aqui as planilhas .xlsx baixadas da pasta do projeto no Google Drive:
+- Sistema_Oferta_Credenciamento_PCT_2027_1-v3.xlsx
+- HORARIOS 2027.1.xlsx

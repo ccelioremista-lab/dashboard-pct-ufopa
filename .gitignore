@@ -1,0 +1,29 @@
+# Python / Cache
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# Segredos locais (NUNCA subir chaves ou senhas ao GitHub)
+.streamlit/secrets.toml
+.env
+
+# Backups internos e arquivos temporarios do Windows/Drive
+backups/
+Iniciar_Dashboard_PCT.bat
+*.tmp
+~$*.xlsx
+Thumbs.db
+desktop.ini
+.vscode/
+
+# Planilhas de versoes antigas e pacotes exportados (manter apenas bases ativas em dados/)
+Pacote_Oficial_*.xlsx
+dados/*-v1.xlsx
+dados/*-v2.xlsx
+dados/*-v3.xlsx
+dados/*-v4.xlsx
+dados/*-v5.xlsx
+!dados/Sistema_Oferta_Credenciamento_PCT_2027_2-v1.xlsx
