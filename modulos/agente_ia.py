@@ -128,34 +128,67 @@ def consultar_agente_groq(
     teto_ch: int = 240,
 ) -> tuple[str, str]:
     """
-    Envia a pergunta ao modelo Groq via LangChain com o contexto real da oferta ativa.
+    Envia a pergunta ao modelo Groq via LangChain com detecção automática de modelo ativo.
     Retorna (resposta_markdown, modo_utilizado).
     """
     chave = (api_key or os.environ.get("GROQ_API_KEY", "")).strip()
     if not chave:
-        return responder_modo_local(pergunta, df_oferta, df_cred, piso_ch=piso_ch, teto_ch=teto_ch), "Local (sem API)"
+        return responder_modo_local(pergunta, df_oferta, df_cred, piso_ch, teto_ch), "Modo Local"
 
     try:
+        from groq import Groq
         from langchain_core.messages import HumanMessage, SystemMessage
         from langchain_groq import ChatGroq
     except ImportError as exc:
         return (
-            f"Biblioteca `langchain-groq` indisponível ({exc}). Usando modo local:\n\n"
-            + responder_modo_local(pergunta, df_oferta, df_cred, piso_ch=piso_ch, teto_ch=teto_ch),
-            "Fallback Local",
+            f"⚠️ Dependência ausente (`{exc}`). Rode `pip install langchain-groq groq`.",
+            "Erro Dependência",
         )
 
-    contexto = montar_contexto_coordenacao(df_oferta, df_cred, piso_ch=piso_ch, teto_ch=teto_ch)
-    sistema = (
-        "Você é o Assistente Técnico de Oferta e Credenciamento Docente do Programa de Ciência e Tecnologia "
-        "(PC&T / IEG / UFOPA). Responda sempre em português do Brasil, de forma objetiva, prática e fiel "
-        "aos dados reais fornecidos abaixo. Nunca invente horários, salas ou docentes que não estejam nos dados.\n\n"
-        + contexto
-    )
-
+    # Descobre dinamicamente os modelos habilitados na sua conta Groq
+    modelos_tentativa = [modelo]
     try:
-        llm = ChatGroq(api_key=chave, model=modelo, temperature=0.2)
-        resp = llm.invoke([SystemMessage(content=sistema), HumanMessage(content=pergunta)])
-        return str(resp.content), f"Groq ({modelo})"
-    except Exception as exc:
-        return f"⚠️ Erro ao consultar a API da Groq: `{exc}`", "Erro API"
+        cliente_nativo = Groq(api_key=chave)
+        ativos = [
+            m.id
+            for m in cliente_nativo.models.list().data
+            if getattr(m, "active", True)
+            and not any(x in m.id.lower() for x in ("whisper", "guard", "tts", "safeguard"))
+        ]
+        # Prioriza modelos Llama, GPT-OSS, Qwen ou Gemma se disponíveis
+        prioritarios = [m for m in ativos if any(k in m.lower() for k in ("llama", "gpt-oss", "qwen", "gemma"))]
+        outros = [m for m in ativos if m not in prioritarios]
+        for candidato in prioritarios + outros:
+            if candidato not in modelos_tentativa:
+                modelos_tentativa.append(candidato)
+    except Exception:
+        pass
+
+    contexto = montar_contexto_coordenacao(df_oferta, df_cred, piso_ch=piso_ch, teto_ch=teto_ch)
+    mensagens = [
+        SystemMessage(
+            content=(
+                "Você é o Assistente Oficial da Coordenação do Curso de Ciência e Tecnologia (PC&T) "
+                "do IEG/UFOPA (Santarém-PA). Responda de forma objetiva, técnica e fiel aos dados abaixo.\n\n"
+                f"{contexto}"
+            )
+        ),
+        HumanMessage(content=pergunta),
+    ]
+
+    ultimo_erro = None
+    for modelo_atual in modelos_tentativa:
+        try:
+            llm = ChatGroq(api_key=chave, model=modelo_atual, temperature=0.2)
+            resposta = llm.invoke(mensagens)
+            return resposta.content, f"Groq ({modelo_atual})"
+        except Exception as exc:
+            ultimo_erro = exc
+            if "model_not_found" in str(exc) or "404" in str(exc):
+                continue
+            return f"⚠️ Erro ao consultar a API da Groq: {exc}", "Erro API"
+
+    return (
+        f"⚠️ Nenhum modelo da conta Groq aceitou a requisição. Modelos testados: `{modelos_tentativa}`. Último erro: {ultimo_erro}",
+        "Erro API",
+    )
