@@ -796,35 +796,36 @@ with aba_ia:
     st.subheader("Assistente IA da Coordenação — PC&T / UFOPA")
     st.caption(
         "Faça perguntas sobre a oferta ativa, choques, encargo docente ou peça rascunhos de ofícios ao IEG. "
-        "Sem chave Groq, responde em Modo Local para consultas rápidas; com chave gratuita da Groq, ativa o Llama 3.3 70B."
+        "Sem chave Groq, responde em Modo Local; com a chave ativa na nuvem, seleciona automaticamente o melhor modelo disponível."
     )
 
+    if "chat_pct_historico" not in st.session_state:
+        st.session_state["chat_pct_historico"] = []
+
     groq_key_secret = _obter_segredo("GROQ_API_KEY", "")
-    col_ia1, col_ia2 = st.columns([2, 1])
+    col_status, col_limpar = st.columns([4, 1])
+
     if groq_key_secret:
-        col_ia1.success("🔑 `GROQ_API_KEY` configurada automaticamente no ambiente/nuvem.")
-        groq_key_manual = col_ia1.text_input(
-            "Substituir chave Groq (opcional):",
-            value="",
-            type="password",
-            placeholder="Deixe vazio para usar a chave configurada na nuvem",
-        )
+        col_status.success("🔑 Assistente IA conectado automaticamente via Groq (nuvem).")
+        with st.expander("⚙️ Configurações avançadas (substituir chave Groq)", expanded=False):
+            groq_key_manual = st.text_input(
+                "Substituir chave Groq (opcional):",
+                value="",
+                type="password",
+                placeholder="Deixe vazio para usar a chave configurada na nuvem",
+            )
         groq_key = groq_key_manual.strip() or groq_key_secret
     else:
-        groq_key = col_ia1.text_input(
+        groq_key = col_status.text_input(
             "GROQ_API_KEY (opcional — gratuita em console.groq.com):",
             value="",
             type="password",
             placeholder="gsk_...",
         )
-    modelo_groq = col_ia2.selectbox(
-        "Modelo Groq:",
-        ["llama-3.1-8b-instant", "llama-3.1-8b-instant"],
-        index=0,
-    )
 
-    if "chat_pct_historico" not in st.session_state:
+    if col_limpar.button("🗑️ Limpar chat", width="stretch"):
         st.session_state["chat_pct_historico"] = []
+        st.rerun()
 
     st.caption("Sugestões rápidas:")
     b1, b2, b3 = st.columns(3)
@@ -853,14 +854,12 @@ with aba_ia:
                     df_oferta,
                     df_cred,
                     api_key=groq_key,
-                    modelo=modelo_groq,
                     piso_ch=piso_ch,
                     teto_ch=teto_ch,
                 )
                 texto_final = f"{resposta}\n\n*— Respondido via `{modo}`*"
                 st.markdown(texto_final)
                 st.session_state["chat_pct_historico"].append({"role": "assistant", "content": texto_final})
-
 # ------------------------------------------------------------------------------
 # ABA 8: CONSULTA DE OFERTA FILTRADA, RESUMO POR CURSO E CREDENCIAMENTO
 # ------------------------------------------------------------------------------
