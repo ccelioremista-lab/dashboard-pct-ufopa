@@ -819,7 +819,7 @@ with aba_ia:
         )
     modelo_groq = col_ia2.selectbox(
         "Modelo Groq:",
-        ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"],
+        ["llama-3.1-8b-instant", "llama-3.1-8b-instant"],
         index=0,
     )
 
