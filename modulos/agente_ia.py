@@ -123,7 +123,7 @@ def consultar_agente_groq(
     df_oferta: pd.DataFrame,
     df_cred: pd.DataFrame,
     api_key: str = "",
-    modelo: str = "llama-3.3-70b-versatile",
+    modelo: str = "llama-3.1-8b-instant",
     piso_ch: int = 120,
     teto_ch: int = 240,
 ) -> tuple[str, str]:
