@@ -123,7 +123,6 @@ st.markdown(
 )
 
 
-
 def _obter_segredo(chave: str, padrao: str = "") -> str:
     """Lê segredos do Streamlit Cloud (st.secrets) com fallback seguro para variáveis de ambiente."""
     try:
@@ -743,8 +742,8 @@ with aba_exportar:
         f"""
         Gera uma pasta de trabalho Excel estilizada e sincronizada com o estado atual do dashboard (**{semestre_cod}**,
         incluindo qualquer ajuste feito no **Simulador** ou no **Otimizador OR-Tools**):
-        - **Abas executivas:** `Resumo_Malha_Fina_IR`, `Encargo_Docente`, `Auditoria_Docentes_PIT`, `Mapa_Salas_PCT`, `Oferta_Consolidada` e `Log_Otimizacao` (quando aplicável).
-        - **Abas oficiais por período/curso ({df_oferta['Aba_Origem'].nunique()} abas):** {abas_atuais_txt} — cada uma já com a **tabela de oferta + grade semanal sincronizada**.
+- **Abas executivas:** `Resumo_Malha_Fina_IR`, `Encargo_Docente`, `Auditoria_Docentes_PIT`, `Mapa_Salas_PCT`, `Oferta_Consolidada` e `Log_Otimizacao` (quando aplicável).
+- **Abas oficiais por período/curso ({df_oferta['Aba_Origem'].nunique()} abas):** {abas_atuais_txt} — cada uma já com a **tabela de oferta + grade semanal sincronizada**.
         """
     )
 
@@ -828,14 +827,19 @@ with aba_ia:
         st.rerun()
 
     st.caption("Sugestões rápidas:")
-    b1, b2, b3 = st.columns(3)
+    b1, b2, b3, b4 = st.columns(4)
     pergunta_rapida = None
-    if b1.button("📋 Resumo dos erros da Malha Fina", width="stretch"):
+    if b1.button("📋 Malha Fina", width="stretch"):
         pergunta_rapida = "Faça um resumo objetivo dos erros impeditivos da Malha Fina atual."
-    if b2.button("🏫 Como estão as 5 salas do PC&T?", width="stretch"):
+    if b2.button("🏫 5 Salas PC&T", width="stretch"):
         pergunta_rapida = "Como está a ocupação e quais janelas livres existem nas 5 salas próprias do PC&T?"
-    if b3.button("👨‍🏫 Quem pode assumir turmas sem docente?", width="stretch"):
+    if b3.button("👨‍🏫 Sem docente", width="stretch"):
         pergunta_rapida = "Quem pode assumir as turmas sem docente considerando habilitação e saldo até 240h?"
+    if b4.button("📄 Ofício IEG", width="stretch"):
+        pergunta_rapida = (
+            "Redija um rascunho de ofício oficial à Direção do IEG encaminhando o panorama "
+            "da oferta ativa do PC&T, destacando eventuais pendências de docentes ou salas externas no NSA."
+        )
 
     for msg in st.session_state["chat_pct_historico"]:
         with st.chat_message(msg["role"]):
@@ -860,6 +864,7 @@ with aba_ia:
                 texto_final = f"{resposta}\n\n*— Respondido via `{modo}`*"
                 st.markdown(texto_final)
                 st.session_state["chat_pct_historico"].append({"role": "assistant", "content": texto_final})
+
 # ------------------------------------------------------------------------------
 # ABA 8: CONSULTA DE OFERTA FILTRADA, RESUMO POR CURSO E CREDENCIAMENTO
 # ------------------------------------------------------------------------------
