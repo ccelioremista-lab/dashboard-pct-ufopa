@@ -1,6 +1,6 @@
 """
 modulos/regras.py
-Motor de Regras e Verificador de Pendências ("Malha Fina do IR") — PC&T / UFOPA (Etapa 5)
+Motor de Regras e Verificador de Pendências ("Malha Fina do IR") — PC&T / UFOPA
 
 Responsabilidades:
 1. Auditar a oferta em tempo real contra todas as regras validadas pela Coordenação do PC&T:
@@ -10,12 +10,13 @@ Responsabilidades:
    - IR-04: Choque físico de sala/laboratório
    - IR-06 / IR-07: Sincronia de horário SIGAA e carga horária
    - IR-08: Turmas sem docente (CONCURSO / A definir) com sugestão de docentes habilitados
-   - IR-09 / IR-10: Salas indefinidas e excesso de lotação (206B=55; demais PC&T=40)
+   - IR-09 / IR-10: Salas indefinidas e excesso de lotação (incluindo soma de turmas unificadas)
    - IR-11: Regra Segunda/Sexta para colaboradores externos (preferência Ter–Qui)
    - IR-12: Dependência de laboratórios externos críticos (Desenho / Informática)
    - IR-13 / IR-14: Piso (120h) e Teto (240h) de encargo docente efetivo
-   - IR-15: Aderência ao credenciamento (PPCs + Histórico)
-2. Sugerir docentes habilitados com saldo disponível até o teto regimental.
+   - IR-15: Aderência ao credenciamento (PPCs + Histórico) com checagem estrita de níveis (I/II/III)
+   - IR-16: Aderência às estruturas curriculares vigentes no SIGAA
+2. Sugerir docentes habilitados priorizando efetivos com saldo suficiente até o teto regimental.
 3. Aplicar edições vindas do Simulador Interativo com re-enriquecimento automático.
 """
 
@@ -37,6 +38,63 @@ from modulos.visualizacoes import calcular_encargo_docente
 SEVERIDADE_ERRO = "🔴 ERRO IMPEDITIVO"
 SEVERIDADE_AVISO = "🟡 AVISO"
 
+_MAPA_NIVEL_DISC = {
+    "i": "1",
+    "1": "1",
+    "ii": "2",
+    "2": "2",
+    "iii": "3",
+    "3": "3",
+    "iv": "4",
+    "4": "4",
+    "v": "5",
+    "5": "5",
+    "vi": "6",
+    "6": "6",
+}
+
+
+def eh_sem_docente(valor: object) -> bool:
+    """Identifica marcações padronizadas de turma sem docente alocado."""
+    return norm(str(valor)) in ("", "concurso", "a definir", "nan", "none")
+
+
+def eh_sem_sala(valor: object) -> bool:
+    """Identifica marcações padronizadas de turma sem sala física definida."""
+    return norm(str(valor)) in ("", "a definir", "nan", "none")
+
+
+def _separar_base_nivel(texto: str) -> tuple[str, str]:
+    tokens = norm(texto).split()
+    if not tokens:
+        return "", ""
+    if len(tokens) > 1 and tokens[-1] in _MAPA_NIVEL_DISC:
+        return " ".join(tokens[:-1]), _MAPA_NIVEL_DISC[tokens[-1]]
+    return " ".join(tokens), ""
+
+
+def disciplinas_compativeis(disc_a: str, disc_b: str) -> bool:
+    """
+    Compara nomes de disciplinas evitando falsos positivos entre níveis distintos
+    (ex.: 'Cálculo I' não casa com 'Cálculo II', mas casa com 'Cálculo 1').
+    """
+    na, nb = norm(disc_a), norm(disc_b)
+    if not na or not nb:
+        return False
+    if na == nb:
+        return True
+
+    base_a, niv_a = _separar_base_nivel(na)
+    base_b, niv_b = _separar_base_nivel(nb)
+
+    if niv_a and niv_b and niv_a != niv_b:
+        return False
+    if (niv_a and not niv_b and niv_a != "1") or (niv_b and not niv_a and niv_b != "1"):
+        return False
+    if base_a == base_b:
+        return True
+    return len(base_a) > 6 and len(base_b) > 6 and (base_a in base_b or base_b in base_a)
+
 
 def sugerir_docentes_habilitados(
     disciplina: str,
@@ -44,28 +102,46 @@ def sugerir_docentes_habilitados(
     df_encargo: pd.DataFrame,
     teto_ch: int = 240,
     limite: int = 3,
+    ch_turma: int = 0,
 ) -> list[str]:
-    """Retorna até N docentes habilitados (PPC/Histórico) com maior saldo até o teto."""
-    dn = norm(disciplina)
-    if not dn:
+    """
+    Retorna até N docentes habilitados (PPC/Histórico), priorizando efetivos PC&T
+    com saldo suficiente para absorver a turma sem ultrapassar o teto regimental.
+    """
+    if not norm(disciplina):
         return []
 
-    habilitados = set()
-    for _, r in df_cred.iterrows():
-        comp_n = norm(r["Componente Curricular Habilitado"])
-        if dn == comp_n or (len(dn) > 6 and (dn in comp_n or comp_n in dn)):
-            habilitados.add(r["Docente"])
-
+    habilitados = {
+        r["Docente"]
+        for _, r in df_cred.iterrows()
+        if disciplinas_compativeis(disciplina, str(r["Componente Curricular Habilitado"]))
+    }
     if not habilitados:
         return []
 
     cand = df_encargo[df_encargo["Docente"].isin(habilitados)].copy()
-    cand = cand.sort_values(by=["Vínculo", "CH_Efetiva", "Docente"], ascending=[False, True, True])
+    if cand.empty:
+        return []
+
+    cand["_eh_efetivo"] = (cand["Vínculo"] == "PC&T (Permanente)").astype(int)
+    cand["_saldo"] = teto_ch - cand["CH_Efetiva"]
+    cand["_cabe_teto"] = (
+        (cand["_eh_efetivo"] == 0) | (cand["_saldo"] >= max(0, int(ch_turma)))
+    ).astype(int)
+
+    cand = cand.sort_values(
+        by=["_cabe_teto", "_eh_efetivo", "CH_Efetiva", "Docente"],
+        ascending=[False, False, True, True],
+    )
 
     sugestoes = []
     for _, row in cand.head(limite).iterrows():
-        saldo = int(teto_ch - row["CH_Efetiva"])
-        tag_saldo = f"saldo {saldo}h" if row["Vínculo"] == "PC&T (Permanente)" else "Colaborador"
+        saldo = int(row["_saldo"])
+        if row["Vínculo"] == "PC&T (Permanente)":
+            alerta = " ⚠️ excede teto" if ch_turma > 0 and saldo < ch_turma else ""
+            tag_saldo = f"saldo {saldo}h{alerta}"
+        else:
+            tag_saldo = "Colaborador"
         sugestoes.append(f"{row['Docente']} ({int(row['CH_Efetiva'])}h; {tag_saldo})")
     return sugestoes
 
@@ -75,8 +151,7 @@ def _docente_habilitado(docente: str, disciplina: str, mapa_hab: dict[str, list[
     lista = mapa_hab.get(docente, [])
     if not lista:
         return False
-    dn = norm(disciplina)
-    return any(dn == h or (len(dn) > 6 and (dn in h or h in dn)) for h in lista)
+    return any(disciplinas_compativeis(disciplina, h) for h in lista)
 
 
 def executar_malha_fina_ir(
@@ -101,9 +176,10 @@ def executar_malha_fina_ir(
 
     mapa_hab: dict[str, list[str]] = {}
     for _, r in df_cred.iterrows():
-        mapa_hab.setdefault(r["Docente"], []).append(norm(r["Componente Curricular Habilitado"]))
+        mapa_hab.setdefault(r["Docente"], []).append(str(r["Componente Curricular Habilitado"]))
 
     pendencias: list[dict[str, str]] = []
+    idxs_unif_cap_checada: set[int] = set()
 
     # Monta tabela expandida de slots para detectar choques de turma, docente e sala
     slot_rows = []
@@ -133,94 +209,137 @@ def executar_malha_fina_ir(
     )
 
     if not df_slots.empty:
-        # 1. IR-00: Choque na mesma turma / período (prioridade absoluta)
-        seen_coh = set()
+        # 1. IR-00: Choque na mesma turma / período (agrupa todos os slots em conflito)
+        choques_coh: dict[tuple[str, tuple[int, ...]], dict] = {}
         for (aba, slot), grp in df_slots.groupby(["Aba", "Slot"]):
             if len(grp) > 1:
                 idxs = tuple(sorted(grp["idx"].unique().tolist()))
-                if (aba, idxs) in seen_coh:
-                    continue
-                seen_coh.add((aba, idxs))
-                det = " vs ".join(
-                    f"{r['Disciplina']} ({r['Docente']})"
-                    for _, r in grp.drop_duplicates("idx").iterrows()
-                )
-                pendencias.append({
-                    "Severidade": SEVERIDADE_ERRO,
-                    "Código_Regra": "IR-00",
-                    "Eixo": "Choque de Turma/Período",
-                    "Alvo": f"[{aba}] Slot {slot}",
-                    "Descrição": f"Choque entre disciplinas do mesmo período/turma: {det}",
-                    "Ação_Recomendada": "Remanejar horário imediatamente (prioridade absoluta da Coordenação).",
-                })
+                chave = (aba, idxs)
+                if chave not in choques_coh:
+                    choques_coh[chave] = {"slots": [], "grp": grp.drop_duplicates("idx")}
+                choques_coh[chave]["slots"].append(slot)
+
+        for (aba, _), info in choques_coh.items():
+            slots_txt = ", ".join(sorted(set(info["slots"])))
+            det = " vs ".join(
+                f"{r['Disciplina']} ({r['Docente']})"
+                for _, r in info["grp"].iterrows()
+            )
+            pendencias.append({
+                "Severidade": SEVERIDADE_ERRO,
+                "Código_Regra": "IR-00",
+                "Eixo": "Choque de Turma/Período",
+                "Alvo": f"[{aba}] {slots_txt}",
+                "Descrição": f"Choque entre disciplinas do mesmo período/turma: {det}",
+                "Ação_Recomendada": "Remanejar horário imediatamente (prioridade absoluta da Coordenação).",
+            })
 
         # 2. IR-01 / IR-02 / IR-03: Choques de Docente vs Turmas Unificadas
-        valid_doc = df_slots[~df_slots["Docente"].isin(["CONCURSO", "A definir", ""])]
-        seen_dp = set()
+        valid_doc = df_slots[~df_slots["Docente"].apply(eh_sem_docente)]
+        conflitos_doc: dict[tuple[str, tuple[int, ...]], dict] = {}
         for (doc, slot), grp in valid_doc.groupby(["Docente", "Slot"]):
             if len(grp) > 1:
                 idxs = tuple(sorted(grp["idx"].unique().tolist()))
-                if (doc, idxs) in seen_dp:
-                    continue
-                seen_dp.add((doc, idxs))
-                det = " + ".join(
-                    f"[{r['Aba']}] {r['Disciplina']} ({r['Sala']})"
-                    for _, r in grp.drop_duplicates("idx").iterrows()
-                )
-                if grp["Familia"].nunique() == 1:
-                    if grp["Sala"].nunique() > 1:
-                        pendencias.append({
-                            "Severidade": SEVERIDADE_ERRO,
-                            "Código_Regra": "IR-01",
-                            "Eixo": "Turma Unificada",
-                            "Alvo": f"{doc} ({slot})",
-                            "Descrição": f"Turma unificável alocada em salas físicas diferentes: {det}",
-                            "Ação_Recomendada": "Alinhar ambas na mesma sala (preferencialmente 206B-NSA se > 40 alunos).",
-                        })
-                    else:
-                        pendencias.append({
-                            "Severidade": SEVERIDADE_AVISO,
-                            "Código_Regra": "IR-02",
-                            "Eixo": "Turma Unificada",
-                            "Alvo": doc,
-                            "Descrição": f"Turma unificada confirmada (CH contabilizada 1x): {det}",
-                            "Ação_Recomendada": "Confirmar vinculação das turmas no lançamento do SIGAA.",
-                        })
-                else:
+                chave = (doc, idxs)
+                if chave not in conflitos_doc:
+                    conflitos_doc[chave] = {
+                        "slots": [],
+                        "grp": grp.drop_duplicates("idx"),
+                        "mesma_fam": grp["Familia"].nunique() == 1,
+                        "salas_distintas": grp["Sala"].nunique() > 1,
+                    }
+                conflitos_doc[chave]["slots"].append(slot)
+                if grp["Sala"].nunique() > 1:
+                    conflitos_doc[chave]["salas_distintas"] = True
+
+        for (doc, _), info in conflitos_doc.items():
+            slots_txt = ", ".join(sorted(set(info["slots"])))
+            det = " + ".join(
+                f"[{r['Aba']}] {r['Disciplina']} ({r['Sala']})"
+                for _, r in info["grp"].iterrows()
+            )
+            if info["mesma_fam"]:
+                if info["salas_distintas"]:
                     pendencias.append({
                         "Severidade": SEVERIDADE_ERRO,
-                        "Código_Regra": "IR-03",
-                        "Eixo": "Choque de Docente",
-                        "Alvo": f"{doc} ({slot})",
-                        "Descrição": f"Docente alocado em duas disciplinas distintas no mesmo horário: {det}",
-                        "Ação_Recomendada": "Alterar o horário de uma das turmas ou realocar docente no Simulador.",
+                        "Código_Regra": "IR-01",
+                        "Eixo": "Turma Unificada",
+                        "Alvo": f"{doc} ({slots_txt})",
+                        "Descrição": f"Turma unificável alocada em salas físicas diferentes: {det}",
+                        "Ação_Recomendada": "Alinhar ambas na mesma sala (preferencialmente 206B-NSA se > 40 alunos).",
                     })
+                else:
+                    pendencias.append({
+                        "Severidade": SEVERIDADE_AVISO,
+                        "Código_Regra": "IR-02",
+                        "Eixo": "Turma Unificada",
+                        "Alvo": f"{doc} ({slots_txt})",
+                        "Descrição": f"Turma unificada confirmada (CH contabilizada 1x): {det}",
+                        "Ação_Recomendada": "Confirmar vinculação das turmas no lançamento do SIGAA.",
+                    })
+            else:
+                pendencias.append({
+                    "Severidade": SEVERIDADE_ERRO,
+                    "Código_Regra": "IR-03",
+                    "Eixo": "Choque de Docente",
+                    "Alvo": f"{doc} ({slots_txt})",
+                    "Descrição": f"Docente alocado em duas disciplinas distintas no mesmo horário: {det}",
+                    "Ação_Recomendada": "Alterar o horário de uma das turmas ou realocar docente no Simulador.",
+                })
 
-        # 3. IR-04: Choque físico de Sala/Laboratório
-        valid_sala = df_slots[~df_slots["Sala"].isin(["A DEFINIR", ""])]
-        seen_sp = set()
+        # 3. IR-04 (Choque físico de sala) e IR-10 combinado para turmas unificadas
+        valid_sala = df_slots[~df_slots["Sala"].apply(eh_sem_sala)]
+        choques_sala: dict[tuple[str, tuple[int, ...]], dict] = {}
+        unif_na_sala: dict[tuple[str, tuple[int, ...]], dict] = {}
+
         for (sala, slot), grp in valid_sala.groupby(["Sala", "Slot"]):
             if len(grp) > 1:
                 idxs = tuple(sorted(grp["idx"].unique().tolist()))
-                if (sala, idxs) in seen_sp:
-                    continue
-                seen_sp.add((sala, idxs))
+                chave = (sala, idxs)
                 if grp["Docente"].nunique() == 1 and grp["Familia"].nunique() == 1:
-                    continue
-                det = " vs ".join(
-                    f"[{r['Aba']}] {r['Disciplina']} ({r['Docente']})"
-                    for _, r in grp.drop_duplicates("idx").iterrows()
+                    if chave not in unif_na_sala:
+                        unif_na_sala[chave] = {"slots": [], "grp": grp.drop_duplicates("idx")}
+                    unif_na_sala[chave]["slots"].append(slot)
+                else:
+                    if chave not in choques_sala:
+                        choques_sala[chave] = {"slots": [], "grp": grp.drop_duplicates("idx")}
+                    choques_sala[chave]["slots"].append(slot)
+
+        for (sala, _), info in choques_sala.items():
+            slots_txt = ", ".join(sorted(set(info["slots"])))
+            det = " vs ".join(
+                f"[{r['Aba']}] {r['Disciplina']} ({r['Docente']})"
+                for _, r in info["grp"].iterrows()
+            )
+            pendencias.append({
+                "Severidade": SEVERIDADE_ERRO,
+                "Código_Regra": "IR-04",
+                "Eixo": "Choque Físico de Sala",
+                "Alvo": f"{sala} ({slots_txt})",
+                "Descrição": f"Sobreposição física de espaço no mesmo horário: {det}",
+                "Ação_Recomendada": "Mover uma das turmas para sala livre do PC&T (ex.: 209B-NSA) ou outro horário.",
+            })
+
+        # Checagem de capacidade somada (IR-10) para turmas unificadas na mesma sala
+        for (sala, idxs), info in unif_na_sala.items():
+            idxs_unif_cap_checada.update(idxs)
+            sinfo = SALAS_INVENTARIO.get(sala, {"Gestao": "Externa", "Capacidade": 40, "Gargalo": "Sim"})
+            vagas_soma = int(info["grp"]["Vagas"].sum())
+            if sinfo["Capacidade"] > 0 and vagas_soma > sinfo["Capacidade"] and sala not in LAB_ROOMS:
+                det_u = " + ".join(
+                    f"[{r['Aba']}] {r['Disciplina']} ({int(r['Vagas'])}v)"
+                    for _, r in info["grp"].iterrows()
                 )
                 pendencias.append({
-                    "Severidade": SEVERIDADE_ERRO,
-                    "Código_Regra": "IR-04",
-                    "Eixo": "Choque Físico de Sala",
-                    "Alvo": f"{sala} ({slot})",
-                    "Descrição": f"Sobreposição física de espaço no mesmo horário: {det}",
-                    "Ação_Recomendada": "Mover uma das turmas para sala livre do PC&T (ex.: 209B-NSA) ou outro horário.",
+                    "Severidade": SEVERIDADE_AVISO,
+                    "Código_Regra": "IR-10",
+                    "Eixo": "Capacidade de Sala",
+                    "Alvo": f"{sala} — Turma Unificada",
+                    "Descrição": f"Soma de {vagas_soma} vagas ({det_u}) excede a capacidade oficial de {sinfo['Capacidade']} lugares.",
+                    "Ação_Recomendada": "Realocar o grupo unificado para 206B-NSA (55 lug.) ou ajustar vagas no SIGAA.",
                 })
 
-    # 4. Auditoria linha a linha (IR-06 a IR-12 e IR-15)
+    # 4. Auditoria linha a linha (IR-06 a IR-12, IR-15 e IR-16)
     for idx, r in df_oferta.iterrows():
         alvo = f"[{r['Aba_Origem']}] {r['Código_SIGAA']} - {r['Componente_Curricular']}"
         slots = expandir_horario_sigaa(r["Horário_SIGAA"])
@@ -271,8 +390,10 @@ def executar_malha_fina_ir(
             })
 
         # IR-08: Sem Docente
-        if doc in ("CONCURSO", "A definir", ""):
-            sugs = sugerir_docentes_habilitados(r["Componente_Curricular"], df_cred, df_encargo, teto_ch=teto_ch)
+        if eh_sem_docente(doc):
+            sugs = sugerir_docentes_habilitados(
+                r["Componente_Curricular"], df_cred, df_encargo, teto_ch=teto_ch, ch_turma=ch_total
+            )
             txt_sug = "Sugestões habilitadas: " + " | ".join(sugs) if sugs else "Definir docente no Colegiado do PC&T."
             pendencias.append({
                 "Severidade": SEVERIDADE_ERRO,
@@ -312,7 +433,7 @@ def executar_malha_fina_ir(
 
         # IR-09 / IR-10 / IR-12: Salas, lotação e gargalos de laboratório
         sinfo = SALAS_INVENTARIO.get(sala, {"Gestao": "Externa", "Capacidade": 40, "Gargalo": "Sim"})
-        if sala == "A DEFINIR" or not sala:
+        if eh_sem_sala(sala):
             pendencias.append({
                 "Severidade": SEVERIDADE_ERRO,
                 "Código_Regra": "IR-09",
@@ -321,7 +442,12 @@ def executar_malha_fina_ir(
                 "Descrição": f"Turma ({vagas} vagas, horário {r['Horário_SIGAA']}) está sem sala definida.",
                 "Ação_Recomendada": "Alocar em sala livre do PC&T (206B=55; 203B/207B/208B/209B=40).",
             })
-        elif sinfo["Capacidade"] > 0 and vagas > sinfo["Capacidade"] and sala not in LAB_ROOMS:
+        elif (
+            idx not in idxs_unif_cap_checada
+            and sinfo["Capacidade"] > 0
+            and vagas > sinfo["Capacidade"]
+            and sala not in LAB_ROOMS
+        ):
             pendencias.append({
                 "Severidade": SEVERIDADE_AVISO,
                 "Código_Regra": "IR-10",
@@ -331,7 +457,7 @@ def executar_malha_fina_ir(
                 "Ação_Recomendada": "Realocar para 206B-NSA (55 lug.) ou ajustar vagas para 40 no SIGAA.",
             })
 
-        if sinfo.get("Gargalo") == "CRÍTICO" and sala != "A DEFINIR":
+        if sinfo.get("Gargalo") == "CRÍTICO" and not eh_sem_sala(sala):
             pendencias.append({
                 "Severidade": SEVERIDADE_AVISO,
                 "Código_Regra": "IR-12",
@@ -421,8 +547,23 @@ def aplicar_edicoes_oferta(df_base: pd.DataFrame, df_editado: pd.DataFrame) -> t
             continue
         mudou = False
         for campo in campos_editaveis:
-            if campo in df_editado.columns and str(df_novo.loc[idx, campo]) != str(row[campo]):
-                df_novo.loc[idx, campo] = row[campo]
+            if campo not in df_editado.columns:
+                continue
+            val_orig = df_novo.loc[idx, campo]
+            val_novo = row[campo]
+
+            if campo == "Vagas":
+                val_orig_cmp = int(val_orig)
+                val_novo_cmp = int(val_novo)
+            elif campo == "Horário_SIGAA":
+                val_orig_cmp = str(val_orig).strip().upper()
+                val_novo_cmp = str(val_novo).strip().upper()
+            else:
+                val_orig_cmp = str(val_orig).strip()
+                val_novo_cmp = str(val_novo).strip()
+
+            if val_orig_cmp != val_novo_cmp:
+                df_novo.loc[idx, campo] = val_novo_cmp
                 mudou = True
         if mudou:
             alteradas += 1
