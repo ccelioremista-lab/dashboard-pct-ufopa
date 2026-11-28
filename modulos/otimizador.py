@@ -1,566 +1,571 @@
 """
-modulos/otimizador.py
-Motor de Otimização Automática com OR-Tools (CP-SAT) — PC&T / UFOPA (v6.1 • Etapa 9A)
+modulos/regras.py
+Motor de Regras e Verificador de Pendências ("Malha Fina do IR") — PC&T / UFOPA
 
 Responsabilidades:
-1. Resolver automaticamente choques de turma (IR-00), docente (IR-03) e sala (IR-04).
-2. Alinhar turmas unificadas na mesma sala física e mesmo horário (IR-01), suportando
-   inclusive unificações de CH distinta (ex.: EMEC0018 45h em 4M123 + EFIS0036 60h em 4M1234).
-3. Preencher horários ausentes (IR-06) e alocar todas as salas 'A DEFINIR' (IR-09),
-   priorizando as 5 salas próprias do PC&T (206B=55; 203B, 207B, 208B, 209B=40)
-   e minimizando a dependência de salas externas CAC/IEG (105A/110B).
-4. Alocar docentes habilitados (PPC/Histórico) às turmas sem docente (IR-08)
-   respeitando o teto regimental (240h).
-5. Refinamentos da Etapa 9A (v6.1):
-   - Opção para FORÇAR Terça–Quinta para colaboradores externos (zerando avisos IR-11).
-   - Priorização reforçada da sala 206B-NSA (55 lug.) para turmas com > 40 vagas (reduzindo IR-10).
-   - Opção para normalizar horários condensados divergentes da CH oficial (IR-07).
+1. Auditar a oferta em tempo real contra todas as regras validadas pela Coordenação do PC&T:
+   - IR-00: Choque de horários na mesma turma/período (prioridade absoluta)
+   - IR-01 / IR-02: Consistência de turmas unificadas (sala única e deduplicação de CH)
+   - IR-03: Choque de horário de docente
+   - IR-04: Choque físico de sala/laboratório
+   - IR-06 / IR-07: Sincronia de horário SIGAA e carga horária
+   - IR-08: Turmas sem docente (CONCURSO / A definir) com sugestão de docentes habilitados
+   - IR-09 / IR-10: Salas indefinidas e excesso de lotação (incluindo soma de turmas unificadas)
+   - IR-11: Regra Segunda/Sexta para colaboradores externos (preferência Ter–Qui)
+   - IR-12: Dependência de laboratórios externos críticos (Desenho / Informática)
+   - IR-13 / IR-14: Piso (120h) e Teto (240h) de encargo docente efetivo
+   - IR-15: Aderência ao credenciamento (PPCs + Histórico) com checagem estrita de níveis (I/II/III)
+   - IR-16: Aderência às estruturas curriculares vigentes no SIGAA
+2. Sugerir docentes habilitados priorizando efetivos com saldo suficiente até o teto regimental.
+3. Aplicar edições vindas do Simulador Interativo com re-enriquecimento automático.
 """
 
 from __future__ import annotations
 
-from typing import Any
-
 import pandas as pd
-from ortools.sat.python import cp_model
 
 from modulos.dados import (
     LAB_ROOMS,
-    SALAS_EXTERNAS_NSA,
     SALAS_INVENTARIO,
-    SALAS_PCT,
+    consultar_componente_sigaa,
     enriquecer_oferta,
     expandir_horario_sigaa,
     extrair_dias_sigaa,
     norm,
 )
-from modulos.regras import executar_malha_fina_ir
+from modulos.visualizacoes import calcular_encargo_docente
+
+SEVERIDADE_ERRO = "🔴 ERRO IMPEDITIVO"
+SEVERIDADE_AVISO = "🟡 AVISO"
+
+_MAPA_NIVEL_DISC = {
+    "i": "1",
+    "1": "1",
+    "ii": "2",
+    "2": "2",
+    "iii": "3",
+    "3": "3",
+    "iv": "4",
+    "4": "4",
+    "v": "5",
+    "5": "5",
+    "vi": "6",
+    "6": "6",
+}
 
 
-def _compactar_slots_sigaa(slots: list[str]) -> str:
-    """Compacta uma lista de slots individuais (ex.: ['4M1','4M2','4M3']) em código SIGAA ('4M123')."""
-    if not slots:
-        return "SEM HORÁRIO NA GRADE"
-
-    por_dia_turno: dict[tuple[str, str], list[str]] = {}
-    for sl in sorted(set(slots)):
-        if len(sl) == 3:
-            por_dia_turno.setdefault((sl[0], sl[1]), []).append(sl[2])
-
-    # Agrupa dias que possuem exatamente o mesmo turno e sequência de horários
-    por_turno_horas: dict[tuple[str, str], list[str]] = {}
-    for (dia, turno), horas in sorted(por_dia_turno.items()):
-        h_str = "".join(sorted(horas))
-        por_turno_horas.setdefault((turno, h_str), []).append(dia)
-
-    blocos = []
-    for (turno, h_str), dias in sorted(por_turno_horas.items(), key=lambda x: ("".join(sorted(x[1])), x[0][0], x[0][1])):
-        blocos.append(f"{''.join(sorted(dias))}{turno}{h_str}")
-    return " / ".join(blocos)
+def eh_sem_docente(valor: object) -> bool:
+    """Identifica marcações padronizadas de turma sem docente alocado."""
+    return norm(str(valor)) in ("", "concurso", "a definir", "nan", "none")
 
 
-def _derivar_subhorario(horario_mestre: str, ch_membro: int, ch_max: int) -> str:
+def eh_sem_sala(valor: object) -> bool:
+    """Identifica marcações padronizadas de turma sem sala física definida."""
+    return norm(str(valor)) in ("", "a definir", "nan", "none")
+
+
+def _separar_base_nivel(texto: str) -> tuple[str, str]:
+    tokens = norm(texto).split()
+    if not tokens:
+        return "", ""
+    if len(tokens) > 1 and tokens[-1] in _MAPA_NIVEL_DISC:
+        return " ".join(tokens[:-1]), _MAPA_NIVEL_DISC[tokens[-1]]
+    return " ".join(tokens), ""
+
+
+def disciplinas_compativeis(disc_a: str, disc_b: str) -> bool:
     """
-    Para grupos unificados com CH distintas (ex.: 45h e 60h), deriva um sub-horário
-    exato para o componente menor a partir dos primeiros slots do horário mestre.
+    Compara nomes de disciplinas evitando falsos positivos entre níveis distintos
+    (ex.: 'Cálculo I' não casa com 'Cálculo II', mas casa com 'Cálculo 1').
     """
-    if ch_membro >= ch_max:
-        return horario_mestre
-    slots_mestre = expandir_horario_sigaa(horario_mestre)
-    qtd_alvo = max(1, int(ch_membro) // 15)
-    if len(slots_mestre) <= qtd_alvo:
-        return horario_mestre
-    return _compactar_slots_sigaa(slots_mestre[:qtd_alvo])
+    na, nb = norm(disc_a), norm(disc_b)
+    if not na or not nb:
+        return False
+    if na == nb:
+        return True
+
+    base_a, niv_a = _separar_base_nivel(na)
+    base_b, niv_b = _separar_base_nivel(nb)
+
+    if niv_a and niv_b and niv_a != niv_b:
+        return False
+    if (niv_a and not niv_b and niv_a != "1") or (niv_b and not niv_a and niv_b != "1"):
+        return False
+    if base_a == base_b:
+        return True
+    return len(base_a) > 6 and len(base_b) > 6 and (base_a in base_b or base_b in base_a)
 
 
-def _gerar_horarios_candidatos(
-    ch_total: int,
-    horario_atual: str,
-    incluir_horario_atual: bool = True,
-    preferir_blocos_continuos: bool = False,
-) -> list[str]:
-    """Gera lista ordenada de códigos SIGAA candidatos compatíveis com a CH da turma."""
-    base_por_ch = {
-        30: [
-            "3M12", "4M12", "5M12", "3M34", "4M34", "5M34",
-            "3T12", "4T12", "5T12", "3T34", "4T34", "5T34",
-            "2M12", "6M12", "2M34", "6M34", "2T12", "6T12", "2T34", "6T34",
-        ],
-        45: [
-            "3M123", "4M123", "5M123", "3T123", "4T123", "5T123",
-            "3T234", "4T234", "5T234", "3M345", "4M345", "5M345",
-            "2M123", "6M123", "2T123", "6T123",
-        ],
-        60: [
-            "4M1234", "3M1234", "5M1234", "3T1234", "4T1234", "5T1234",
-            "35M12", "35M34", "35T12", "35T34",
-            "24M12", "24M34", "24T12", "24T34",
-            "2M1234", "6M1234", "2T1234", "6T1234",
-            "46M12", "46M34", "46T12", "46T34",
-        ] if preferir_blocos_continuos else [
-            "35M12", "35M34", "35T12", "35T34",
-            "3M1234", "4M1234", "5M1234", "3T1234", "4T1234", "5T1234",
-            "24M12", "24M34", "24T12", "24T34",
-            "2M1234", "6M1234", "2T1234", "6T1234",
-            "46M12", "46M34", "46T12", "46T34",
-        ],
-        75: [
-            "35M12 / 5M3", "35M34 / 5M5", "35T12 / 5T3", "35T34 / 4T3",
-            "4M12345", "3M12345", "5M12345",
-            "24M12 / 4M3", "24M34 / 4M5", "24T12 / 4T3", "24T34 / 4T5",
-        ],
-        90: [
-            "35M123", "35M345", "35T123", "35T345",
-            "24M123", "24M345", "24T123", "24T345",
-        ],
-    }
-
-    candidatos: list[str] = []
-    if (
-        incluir_horario_atual
-        and horario_atual
-        and "SEM HORÁRIO" not in horario_atual.upper()
-        and len(expandir_horario_sigaa(horario_atual)) > 0
-    ):
-        candidatos.append(horario_atual)
-
-    padroes = list(base_por_ch.get(int(ch_total), base_por_ch[60]))
-    if horario_atual and any("N" in sl for sl in expandir_horario_sigaa(horario_atual)):
-        noite_por_ch = {
-            60: ["2N1234", "3N1234", "4N1234", "5N1234", "35N12", "24N12"],
-            90: ["3N1234 / 5N12", "2N1234 / 6N12", "35N123", "24N123"],
-        }
-        padroes = noite_por_ch.get(int(ch_total), []) + padroes
-    for p in padroes:
-        if p not in candidatos:
-            candidatos.append(p)
-    return candidatos
-
-
-def _docentes_candidatos_para_turma(
+def sugerir_docentes_habilitados(
     disciplina: str,
     df_cred: pd.DataFrame,
-    ch_atual_doc: dict[str, int],
-    ch_turma: int,
-    teto_ch: int,
+    df_encargo: pd.DataFrame,
+    teto_ch: int = 240,
+    limite: int = 3,
+    ch_turma: int = 0,
 ) -> list[str]:
-    """Seleciona docentes habilitados (PPC/Histórico) com saldo <= teto para turmas pendentes."""
-    dn = norm(disciplina)
-    efetivos = sorted(
-        df_cred[df_cred["Vínculo"] == "PC&T (Permanente)"]["Docente"].dropna().unique().tolist()
+    """
+    Retorna até N docentes habilitados (PPC/Histórico), priorizando efetivos PC&T
+    com saldo suficiente para absorver a turma sem ultrapassar o teto regimental.
+    """
+    if not norm(disciplina):
+        return []
+
+    habilitados = {
+        r["Docente"]
+        for _, r in df_cred.iterrows()
+        if disciplinas_compativeis(disciplina, str(r["Componente Curricular Habilitado"]))
+    }
+    if not habilitados:
+        return []
+
+    cand = df_encargo[df_encargo["Docente"].isin(habilitados)].copy()
+    if cand.empty:
+        return []
+
+    cand["_eh_efetivo"] = (cand["Vínculo"] == "PC&T (Permanente)").astype(int)
+    cand["_saldo"] = teto_ch - cand["CH_Efetiva"]
+    cand["_cabe_teto"] = (
+        (cand["_eh_efetivo"] == 0) | (cand["_saldo"] >= max(0, int(ch_turma)))
+    ).astype(int)
+
+    cand = cand.sort_values(
+        by=["_cabe_teto", "_eh_efetivo", "CH_Efetiva", "Docente"],
+        ascending=[False, False, True, True],
     )
-    colabs = sorted(
-        df_cred[df_cred["Vínculo"] == "Colaborador Externo"]["Docente"].dropna().unique().tolist()
-    )
 
-    habilitados_ef = []
-    habilitados_col = []
-    for _, r in df_cred.iterrows():
-        comp_n = norm(r["Componente Curricular Habilitado"])
-        if dn == comp_n or (len(dn) > 6 and (dn in comp_n or comp_n in dn)):
-            doc = r["Docente"]
-            if doc in efetivos and doc not in habilitados_ef:
-                habilitados_ef.append(doc)
-            elif doc in colabs and doc not in habilitados_col:
-                habilitados_col.append(doc)
-
-    # Afinidade por palavras-chave para disciplinas sem match literal na matriz (ex.: Mecânica dos Sólidos)
-    if not habilitados_ef and not habilitados_col:
-        palavras_chave = [w for w in dn.split() if len(w) >= 5 and w not in ("geral", "basica", "aplicada")]
-        for _, r in df_cred.iterrows():
-            comp_n = norm(r["Componente Curricular Habilitado"])
-            if any(w in comp_n for w in palavras_chave) or (
-                "solidos" in dn and "resistencia dos materiais" in comp_n
-            ):
-                doc = r["Docente"]
-                if doc in efetivos and doc not in habilitados_ef:
-                    habilitados_ef.append(doc)
-
-    habilitados_ef.sort(key=lambda d: (ch_atual_doc.get(d, 0), d))
-    habilitados_col.sort(key=lambda d: (ch_atual_doc.get(d, 0), d))
-
-    validos = [d for d in habilitados_ef if ch_atual_doc.get(d, 0) + ch_turma <= teto_ch]
-    validos += habilitados_col
-
-    if not validos:
-        validos = [
-            d for d in sorted(efetivos, key=lambda x: (ch_atual_doc.get(x, 0), x))
-            if ch_atual_doc.get(d, 0) + ch_turma <= teto_ch
-        ][:4]
-
-    return validos
+    sugestoes = []
+    for _, row in cand.head(limite).iterrows():
+        saldo = int(row["_saldo"])
+        if row["Vínculo"] == "PC&T (Permanente)":
+            alerta = " ⚠️ excede teto" if ch_turma > 0 and saldo < ch_turma else ""
+            tag_saldo = f"saldo {saldo}h{alerta}"
+        else:
+            tag_saldo = "Colaborador"
+        sugestoes.append(f"{row['Docente']} ({int(row['CH_Efetiva'])}h; {tag_saldo})")
+    return sugestoes
 
 
-def otimizar_oferta_ortools(
+def _docente_habilitado(docente: str, disciplina: str, mapa_hab: dict[str, list[str]]) -> bool:
+    """Verifica se a disciplina consta na lista de habilitações (PPC + Histórico) do docente."""
+    lista = mapa_hab.get(docente, [])
+    if not lista:
+        return False
+    return any(disciplinas_compativeis(disciplina, h) for h in lista)
+
+
+def executar_malha_fina_ir(
     df_oferta: pd.DataFrame,
     df_cred: pd.DataFrame,
     piso_ch: int = 120,
     teto_ch: int = 240,
-    alocar_docentes_pendentes: bool = True,
-    evitar_seg_sex_colab: bool = True,
-    forcar_ter_qui_colab: bool = False,
-    priorizar_206b_grandes: bool = True,
-    normalizar_horarios_condensados: bool = False,
-    tempo_limite_seg: float = 10.0,
-) -> dict[str, Any]:
+) -> tuple[pd.DataFrame, pd.DataFrame, set[int], dict[str, int]]:
     """
-    Executa o solver Google OR-Tools CP-SAT para gerar uma grade livre de choques,
-    maximizar o uso das 5 salas próprias do PC&T e minimizar avisos da Malha Fina IR.
+    Executa a auditoria completa estilo 'Malha Fina do Imposto de Renda'.
+
+    Retorna:
+        df_pendencias: DataFrame ordenado com todas as pendências (Erros e Avisos).
+        df_encargo: DataFrame consolidado de encargo docente efetivo.
+        unif_secundarias: conjunto de índices de turmas unificadas secundárias.
+        resumo_ir: dicionário com contadores rápidos para KPIs.
     """
-    df_orig = df_oferta.copy().reset_index(drop=True)
-    df_pend_antes, df_enc_antes, unif_sec_antes, resumo_antes = executar_malha_fina_ir(
-        df_orig, df_cred, piso_ch=piso_ch, teto_ch=teto_ch
+    df_encargo, unif_secundarias = calcular_encargo_docente(
+        df_oferta, df_cred, piso_ch=piso_ch, teto_ch=teto_ch
+    )
+    vinculo_map = df_cred.drop_duplicates("Docente").set_index("Docente")["Vínculo"].to_dict()
+
+    mapa_hab: dict[str, list[str]] = {}
+    for _, r in df_cred.iterrows():
+        mapa_hab.setdefault(r["Docente"], []).append(str(r["Componente Curricular Habilitado"]))
+
+    pendencias: list[dict[str, str]] = []
+    idxs_unif_cap_checada: set[int] = set()
+
+    # Monta tabela expandida de slots para detectar choques de turma, docente e sala
+    slot_rows = []
+    for idx, r in df_oferta.iterrows():
+        slots = expandir_horario_sigaa(r["Horário_SIGAA"])
+        fam = r.get("Família_Unificação", norm(r["Componente_Curricular"]))
+        for sl in slots:
+            slot_rows.append({
+                "idx": idx,
+                "Slot": sl,
+                "Aba": str(r["Aba_Origem"]),
+                "Codigo": str(r["Código_SIGAA"]),
+                "Disciplina": str(r["Componente_Curricular"]),
+                "Familia": fam,
+                "Docente": str(r["Docente_Alocado"]).strip(),
+                "Sala": str(r["Sala_Alocada"]).strip(),
+                "CH": int(r["CH_Total"]),
+                "Vagas": int(r["Vagas"]),
+            })
+
+    df_slots = (
+        pd.DataFrame(slot_rows)
+        if slot_rows
+        else pd.DataFrame(
+            columns=["idx", "Slot", "Aba", "Codigo", "Disciplina", "Familia", "Docente", "Sala", "CH", "Vagas"]
+        )
     )
 
-    vinculo_map = df_cred.drop_duplicates("Docente").set_index("Docente")["Vínculo"].to_dict()
-    ch_atual_map = df_enc_antes.set_index("Docente")["CH_Efetiva"].to_dict()
+    if not df_slots.empty:
+        # 1. IR-00: Choque na mesma turma / período (agrupa todos os slots em conflito)
+        choques_coh: dict[tuple[str, tuple[int, ...]], dict] = {}
+        for (aba, slot), grp in df_slots.groupby(["Aba", "Slot"]):
+            if len(grp) > 1:
+                idxs = tuple(sorted(grp["idx"].unique().tolist()))
+                chave = (aba, idxs)
+                if chave not in choques_coh:
+                    choques_coh[chave] = {"slots": [], "grp": grp.drop_duplicates("idx")}
+                choques_coh[chave]["slots"].append(slot)
 
-    # 1. Agrupa turmas unificadas (mesmo docente + mesma família + sobreposição de slots)
-    #    Ordenando cada grupo pela maior CH primeiro (ex.: EFIS0036 60h antes de EMEC0018 45h)
-    grupos: list[list[int]] = []
-    idx_para_grupo: dict[int, int] = {}
-
-    for idx, row in df_orig.iterrows():
-        if idx in idx_para_grupo:
-            continue
-        doc = str(row["Docente_Alocado"]).strip()
-        fam = row.get("Família_Unificação", norm(row["Componente_Curricular"]))
-        slots_i = set(expandir_horario_sigaa(row["Horário_SIGAA"]))
-        membros = [idx]
-
-        if doc not in ("CONCURSO", "A definir", "") and slots_i:
-            for j, rj in df_orig.iterrows():
-                if j <= idx or j in idx_para_grupo:
-                    continue
-                if (
-                    str(rj["Docente_Alocado"]).strip() == doc
-                    and rj.get("Família_Unificação", norm(rj["Componente_Curricular"])) == fam
-                    and (slots_i & set(expandir_horario_sigaa(rj["Horário_SIGAA"])))
-                ):
-                    membros.append(j)
-
-        membros.sort(key=lambda m: (-int(df_orig.loc[m, "CH_Total"]), m))
-        gid = len(grupos)
-        grupos.append(membros)
-        for m in membros:
-            idx_para_grupo[m] = gid
-
-    # 2. Construção do modelo CP-SAT
-    model = cp_model.CpModel()
-
-    h_cands: dict[int, list[str]] = {}
-    s_cands: dict[int, list[str]] = {}
-    d_cands: dict[int, list[str]] = {}
-
-    h_vars: dict[int, list[cp_model.IntVar]] = {}
-    s_vars: dict[int, list[cp_model.IntVar]] = {}
-    d_vars: dict[int, list[cp_model.IntVar]] = {}
-
-    penalidades: list[cp_model.LinearExpr] = []
-
-    for gid, membros in enumerate(grupos):
-        r0 = df_orig.loc[membros[0]]  # membro de maior CH no grupo
-        ch_max = int(r0["CH_Total"])
-        ch_mista = len({int(df_orig.loc[m, "CH_Total"]) for m in membros}) > 1
-        hor_atual = str(r0["Horário_SIGAA"]).strip()
-        sala_atual = str(r0["Sala_Alocada"]).strip()
-        doc_atual = str(r0["Docente_Alocado"]).strip()
-        max_vagas = max(int(df_orig.loc[m, "Vagas"]) for m in membros)
-
-        # --- Docentes candidatos ---
-        if alocar_docentes_pendentes and doc_atual in ("CONCURSO", "A definir", ""):
-            dc = _docentes_candidatos_para_turma(
-                r0["Componente_Curricular"], df_cred, ch_atual_map, ch_max, teto_ch
+        for (aba, _), info in choques_coh.items():
+            slots_txt = ", ".join(sorted(set(info["slots"])))
+            det = " vs ".join(
+                f"{r['Disciplina']} ({r['Docente']})"
+                for _, r in info["grp"].iterrows()
             )
-            if not dc:
-                dc = [doc_atual]
-        else:
-            dc = [doc_atual]
+            pendencias.append({
+                "Severidade": SEVERIDADE_ERRO,
+                "Código_Regra": "IR-00",
+                "Eixo": "Choque de Turma/Período",
+                "Alvo": f"[{aba}] {slots_txt}",
+                "Descrição": f"Choque entre disciplinas do mesmo período/turma: {det}",
+                "Ação_Recomendada": "Remanejar horário imediatamente (prioridade absoluta da Coordenação).",
+            })
 
-        tem_colab_cand = any(vinculo_map.get(d_c) == "Colaborador Externo" for d_c in dc)
+        # 2. IR-01 / IR-02 / IR-03: Choques de Docente vs Turmas Unificadas
+        valid_doc = df_slots[~df_slots["Docente"].apply(eh_sem_docente)]
+        conflitos_doc: dict[tuple[str, tuple[int, ...]], dict] = {}
+        for (doc, slot), grp in valid_doc.groupby(["Docente", "Slot"]):
+            if len(grp) > 1:
+                idxs = tuple(sorted(grp["idx"].unique().tolist()))
+                chave = (doc, idxs)
+                if chave not in conflitos_doc:
+                    conflitos_doc[chave] = {
+                        "slots": [],
+                        "grp": grp.drop_duplicates("idx"),
+                        "mesma_fam": grp["Familia"].nunique() == 1,
+                        "salas_distintas": grp["Sala"].nunique() > 1,
+                    }
+                conflitos_doc[chave]["slots"].append(slot)
+                if grp["Sala"].nunique() > 1:
+                    conflitos_doc[chave]["salas_distintas"] = True
 
-        # --- Horários candidatos ---
-        slots_orig = expandir_horario_sigaa(hor_atual)
-        ch_atual_bate = len(slots_orig) * 15 == ch_max
-        # Se grupo tem CH mista (ex.: 45h + 60h) ou normalização está ativa, exige horário exato de ch_max
-        manter_hor_atual = ch_atual_bate or (not ch_mista and not normalizar_horarios_condensados)
-
-        hc = _gerar_horarios_candidatos(
-            ch_max,
-            hor_atual,
-            incluir_horario_atual=manter_hor_atual,
-            preferir_blocos_continuos=ch_mista,
-        )
-        h_cands[gid] = hc
-        h_vars[gid] = [model.NewBoolVar(f"h_{gid}_{i}") for i in range(len(hc))]
-        model.AddExactlyOne(h_vars[gid])
-
-        for i, h_code in enumerate(hc):
-            slots_cand = set(expandir_horario_sigaa(h_code))
-            if h_code != hor_atual:
-                # Se todos os slots do candidato já estavam contidos no horário original (ex.: 4M1234 dentro de 4M12345), custo mínimo
-                if slots_orig and slots_cand.issubset(set(slots_orig)):
-                    penalidades.append(h_vars[gid][i] * 5)
-                elif slots_orig and len(slots_cand & set(slots_orig)) >= max(2, len(slots_cand) - 1):
-                    penalidades.append(h_vars[gid][i] * 40)
+        for (doc, _), info in conflitos_doc.items():
+            slots_txt = ", ".join(sorted(set(info["slots"])))
+            det = " + ".join(
+                f"[{r['Aba']}] {r['Disciplina']} ({r['Sala']})"
+                for _, r in info["grp"].iterrows()
+            )
+            if info["mesma_fam"]:
+                if info["salas_distintas"]:
+                    pendencias.append({
+                        "Severidade": SEVERIDADE_ERRO,
+                        "Código_Regra": "IR-01",
+                        "Eixo": "Turma Unificada",
+                        "Alvo": f"{doc} ({slots_txt})",
+                        "Descrição": f"Turma unificável alocada em salas físicas diferentes: {det}",
+                        "Ação_Recomendada": "Alinhar ambas na mesma sala (preferencialmente 206B-NSA se > 40 alunos).",
+                    })
                 else:
-                    penalidades.append(h_vars[gid][i] * 250)
-
-            # Em grupos de CH mista (45h + 60h), prioriza blocos contínuos num mesmo dia (ex.: 4M1234 -> 4M123)
-            if ch_mista and len(extrair_dias_sigaa(h_code)) > 1:
-                penalidades.append(h_vars[gid][i] * 45)
-
-            # Regra Segunda/Sexta para colaboradores externos
-            if tem_colab_cand:
-                dias = extrair_dias_sigaa(h_code)
-                if "2" in dias or "6" in dias:
-                    if forcar_ter_qui_colab:
-                        penalidades.append(h_vars[gid][i] * 2000)
-                    elif evitar_seg_sex_colab:
-                        penalidades.append(h_vars[gid][i] * 60)
-
-        # --- Salas candidatas ---
-        if sala_atual in LAB_ROOMS:
-            sc = [sala_atual]
-        else:
-            sc = list(SALAS_PCT) + list(SALAS_EXTERNAS_NSA)
-            if sala_atual not in sc and sala_atual != "A DEFINIR" and sala_atual:
-                sc.append(sala_atual)
-
-        s_cands[gid] = sc
-        s_vars[gid] = [model.NewBoolVar(f"s_{gid}_{i}") for i in range(len(sc))]
-        model.AddExactlyOne(s_vars[gid])
-
-        for i, s_nome in enumerate(sc):
-            cap = SALAS_INVENTARIO.get(s_nome, {}).get("Capacidade", 40)
-            if s_nome in SALAS_EXTERNAS_NSA:
-                penalidades.append(s_vars[gid][i] * 80)
-            elif s_nome != sala_atual and sala_atual != "A DEFINIR":
-                penalidades.append(s_vars[gid][i] * 5)
-
-            # Priorização reforçada da 206B-NSA (55 lug.) para turmas com > 40 vagas (sem bagunçar horários originais)
-            if s_nome not in LAB_ROOMS and cap > 0:
-                if max_vagas > cap:
-                    peso_lotacao = 140 if priorizar_206b_grandes else 30
-                    penalidades.append(s_vars[gid][i] * peso_lotacao)
-                elif priorizar_206b_grandes and s_nome == "206B-NSA" and max_vagas <= 40:
-                    # Evita desperdiçar a sala de 55 lugares com turmas pequenas se houver sala de 40 livre
-                    penalidades.append(s_vars[gid][i] * 20)
-
-        # --- Docentes candidatos ---
-        d_cands[gid] = dc
-        d_vars[gid] = [model.NewBoolVar(f"d_{gid}_{i}") for i in range(len(dc))]
-        model.AddExactlyOne(d_vars[gid])
-
-        if len(dc) > 1:
-            for i, d_nome in enumerate(dc):
-                peso_ch = int(ch_atual_map.get(d_nome, 0) // 15)
-                penalidades.append(
-                    d_vars[gid][i]
-                    * (peso_ch + (15 if vinculo_map.get(d_nome) != "PC&T (Permanente)" else 0))
-                )
-
-    # 3. Restrições Duras de Não-Sobreposição (IR-00, IR-03, IR-04) e Teto CH (IR-14)
-    grupo_usa_slot: dict[tuple[int, str], cp_model.IntVar] = {}
-    membro_usa_slot: dict[tuple[int, str], cp_model.IntVar] = {}
-    todos_slots: set[str] = set()
-
-    for gid, membros in enumerate(grupos):
-        ch_max = int(df_orig.loc[membros[0], "CH_Total"])
-        slot_to_hvars: dict[str, list[cp_model.IntVar]] = {}
-        for i, h_code in enumerate(h_cands[gid]):
-            for sl in expandir_horario_sigaa(h_code):
-                todos_slots.add(sl)
-                slot_to_hvars.setdefault(sl, []).append(h_vars[gid][i])
-        for sl, vlist in slot_to_hvars.items():
-            if len(vlist) == 1:
-                grupo_usa_slot[(gid, sl)] = vlist[0]
+                    pendencias.append({
+                        "Severidade": SEVERIDADE_AVISO,
+                        "Código_Regra": "IR-02",
+                        "Eixo": "Turma Unificada",
+                        "Alvo": f"{doc} ({slots_txt})",
+                        "Descrição": f"Turma unificada confirmada (CH contabilizada 1x): {det}",
+                        "Ação_Recomendada": "Confirmar vinculação das turmas no lançamento do SIGAA.",
+                    })
             else:
-                aux = model.NewBoolVar(f"gs_{gid}_{sl}")
-                model.Add(aux == sum(vlist))
-                grupo_usa_slot[(gid, sl)] = aux
-
-        # Slots efetivamente ocupados por cada membro (exato para CH mista)
-        for m in membros:
-            ch_m = int(df_orig.loc[m, "CH_Total"])
-            if ch_m >= ch_max:
-                for sl in slot_to_hvars:
-                    membro_usa_slot[(m, sl)] = grupo_usa_slot[(gid, sl)]
-            else:
-                m_slot_map: dict[str, list[cp_model.IntVar]] = {}
-                for i, h_code in enumerate(h_cands[gid]):
-                    sub_h = _derivar_subhorario(h_code, ch_m, ch_max)
-                    for sl in expandir_horario_sigaa(sub_h):
-                        todos_slots.add(sl)
-                        m_slot_map.setdefault(sl, []).append(h_vars[gid][i])
-                for sl, vlist in m_slot_map.items():
-                    if len(vlist) == 1:
-                        membro_usa_slot[(m, sl)] = vlist[0]
-                    else:
-                        aux_m = model.NewBoolVar(f"ms_{m}_{sl}")
-                        model.Add(aux_m == sum(vlist))
-                        membro_usa_slot[(m, sl)] = aux_m
-
-    # 3a. IR-00: Zero choques na mesma turma / período (Aba_Origem)
-    abas_membros: dict[str, list[int]] = {}
-    for idx in range(len(df_orig)):
-        aba = str(df_orig.loc[idx, "Aba_Origem"])
-        abas_membros.setdefault(aba, []).append(idx)
-
-    for aba, mids in abas_membros.items():
-        if len(mids) <= 1:
-            continue
-        for sl in todos_slots:
-            ativos = [membro_usa_slot[(m, sl)] for m in mids if (m, sl) in membro_usa_slot]
-            if len(ativos) > 1:
-                model.Add(sum(ativos) <= 1)
-
-    # 3b. IR-03: Zero choques de Docente
-    doc_grupos: dict[str, list[tuple[int, int]]] = {}
-    for gid in range(len(grupos)):
-        for di, d_nome in enumerate(d_cands[gid]):
-            if d_nome not in ("CONCURSO", "A definir", ""):
-                doc_grupos.setdefault(d_nome, []).append((gid, di))
-
-    for d_nome, pares in doc_grupos.items():
-        if len(pares) <= 1:
-            continue
-        for sl in todos_slots:
-            ativos = []
-            for gid, di in pares:
-                if (gid, sl) not in grupo_usa_slot:
-                    continue
-                if len(d_cands[gid]) == 1:
-                    ativos.append(grupo_usa_slot[(gid, sl)])
-                else:
-                    prod = model.NewBoolVar(f"ds_{gid}_{di}_{sl}")
-                    model.AddMultiplicationEquality(prod, [d_vars[gid][di], grupo_usa_slot[(gid, sl)]])
-                    ativos.append(prod)
-            if len(ativos) > 1:
-                model.Add(sum(ativos) <= 1)
-
-    # 3c. IR-14: Teto regimental de CH + balanceamento suave de carga (evita abaixo do piso e sobrecarga)
-    for d_nome, pares in doc_grupos.items():
-        if vinculo_map.get(d_nome) != "PC&T (Permanente)":
-            continue
-        tem_variavel = any(len(d_cands[gid]) > 1 for gid, _ in pares)
-        if tem_variavel:
-            termos_ch = []
-            for gid, di in pares:
-                ch_g = int(df_orig.loc[grupos[gid][0], "CH_Total"])
-                termos_ch.append(d_vars[gid][di] * ch_g)
-            ch_total_var = model.NewIntVar(0, teto_ch, f"chdoc_{norm(d_nome).replace(' ', '_')[:18]}")
-            model.Add(ch_total_var == sum(termos_ch))
-            # Penalidade suave se ficar abaixo do piso (120h) — incentiva todos os 19 efetivos a cumprirem o piso
-            deficit_piso = model.NewIntVar(0, piso_ch, f"def_{norm(d_nome).replace(' ', '_')[:18]}")
-            model.Add(deficit_piso >= piso_ch - ch_total_var)
-            penalidades.append(deficit_piso * 6)
-            # Penalidade suave acima de 195h — distribui a carga de forma equilibrada sem concentrar em 240h
-            alvo_eq = min(teto_ch, max(piso_ch + 60, 195))
-            excesso_eq = model.NewIntVar(0, teto_ch, f"exc_{norm(d_nome).replace(' ', '_')[:18]}")
-            model.Add(excesso_eq >= ch_total_var - alvo_eq)
-            penalidades.append(excesso_eq * 2)
-
-    # 3d. IR-04: Zero choques físicos de Sala / Laboratório
-    sala_grupos: dict[str, list[tuple[int, int]]] = {}
-    for gid in range(len(grupos)):
-        for si, s_nome in enumerate(s_cands[gid]):
-            sala_grupos.setdefault(s_nome, []).append((gid, si))
-
-    for s_nome, pares in sala_grupos.items():
-        if len(pares) <= 1:
-            continue
-        for sl in todos_slots:
-            ativos = []
-            for gid, si in pares:
-                if (gid, sl) not in grupo_usa_slot:
-                    continue
-                if len(s_cands[gid]) == 1:
-                    ativos.append(grupo_usa_slot[(gid, sl)])
-                else:
-                    prod = model.NewBoolVar(f"ss_{gid}_{si}_{sl}")
-                    model.AddMultiplicationEquality(prod, [s_vars[gid][si], grupo_usa_slot[(gid, sl)]])
-                    ativos.append(prod)
-            if len(ativos) > 1:
-                model.Add(sum(ativos) <= 1)
-
-    # 3e. Dicas iniciais (warm-start) para acelerar convergência do CP-SAT
-    for gid, membros in enumerate(grupos):
-        r0 = df_orig.loc[membros[0]]
-        hor_atual = str(r0["Horário_SIGAA"]).strip()
-        max_vagas = max(int(df_orig.loc[m, "Vagas"]) for m in membros)
-        if hor_atual in h_cands[gid]:
-            idx_h = h_cands[gid].index(hor_atual)
-            model.AddHint(h_vars[gid][idx_h], 1)
-        if priorizar_206b_grandes and max_vagas > 40 and "206B-NSA" in s_cands[gid]:
-            model.AddHint(s_vars[gid][s_cands[gid].index("206B-NSA")], 1)
-
-    # 4. Função Objetivo e Resolução
-    model.Minimize(sum(penalidades))
-
-    solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = float(tempo_limite_seg)
-    solver.parameters.num_search_workers = 8
-    status = solver.Solve(model)
-    status_nome = solver.StatusName(status)
-
-    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        return {
-            "sucesso": False,
-            "status_solver": status_nome,
-            "df_otimizado": df_orig,
-            "df_log": pd.DataFrame(),
-            "resumo_antes": resumo_antes,
-            "resumo_depois": resumo_antes,
-            "tempo_seg": round(solver.WallTime(), 2),
-        }
-
-    # 5. Extrai solução e monta log 'Antes -> Depois'
-    df_otim = df_orig.copy()
-    log_rows = []
-
-    for gid, membros in enumerate(grupos):
-        ch_max = int(df_orig.loc[membros[0], "CH_Total"])
-        h_mestre = next(h_cands[gid][i] for i, v in enumerate(h_vars[gid]) if solver.Value(v) == 1)
-        s_escolhida = next(s_cands[gid][i] for i, v in enumerate(s_vars[gid]) if solver.Value(v) == 1)
-        d_escolhido = next(d_cands[gid][i] for i, v in enumerate(d_vars[gid]) if solver.Value(v) == 1)
-
-        for idx in membros:
-            ch_m = int(df_orig.loc[idx, "CH_Total"])
-            h_escolhido = _derivar_subhorario(h_mestre, ch_m, ch_max)
-
-            h_old = str(df_orig.loc[idx, "Horário_SIGAA"]).strip()
-            s_old = str(df_orig.loc[idx, "Sala_Alocada"]).strip()
-            d_old = str(df_orig.loc[idx, "Docente_Alocado"]).strip()
-
-            mudancas = []
-            if h_escolhido != h_old:
-                df_otim.loc[idx, "Horário_SIGAA"] = h_escolhido
-                mudancas.append(f"Horário: {h_old} → {h_escolhido}")
-            if s_escolhida != s_old:
-                df_otim.loc[idx, "Sala_Alocada"] = s_escolhida
-                mudancas.append(f"Sala: {s_old} → {s_escolhida}")
-            if d_escolhido != d_old:
-                df_otim.loc[idx, "Docente_Alocado"] = d_escolhido
-                mudancas.append(f"Docente: {d_old} → {d_escolhido}")
-
-            if mudancas:
-                log_rows.append({
-                    "Turma": df_orig.loc[idx, "Aba_Origem"],
-                    "Código": df_orig.loc[idx, "Código_SIGAA"],
-                    "Disciplina": df_orig.loc[idx, "Componente_Curricular"],
-                    "Alterações_Aplicadas": " | ".join(mudancas),
+                pendencias.append({
+                    "Severidade": SEVERIDADE_ERRO,
+                    "Código_Regra": "IR-03",
+                    "Eixo": "Choque de Docente",
+                    "Alvo": f"{doc} ({slots_txt})",
+                    "Descrição": f"Docente alocado em duas disciplinas distintas no mesmo horário: {det}",
+                    "Ação_Recomendada": "Alterar o horário de uma das turmas ou realocar docente no Simulador.",
                 })
 
-    df_otim = enriquecer_oferta(df_otim)
-    _, _, _, resumo_depois = executar_malha_fina_ir(df_otim, df_cred, piso_ch=piso_ch, teto_ch=teto_ch)
+        # 3. IR-04 (Choque físico de sala) e IR-10 combinado para turmas unificadas
+        valid_sala = df_slots[~df_slots["Sala"].apply(eh_sem_sala)]
+        choques_sala: dict[tuple[str, tuple[int, ...]], dict] = {}
+        unif_na_sala: dict[tuple[str, tuple[int, ...]], dict] = {}
 
-    return {
-        "sucesso": True,
-        "status_solver": status_nome,
-        "df_otimizado": df_otim,
-        "df_log": pd.DataFrame(log_rows),
-        "resumo_antes": resumo_antes,
-        "resumo_depois": resumo_depois,
-        "tempo_seg": round(solver.WallTime(), 2),
+        for (sala, slot), grp in valid_sala.groupby(["Sala", "Slot"]):
+            if len(grp) > 1:
+                idxs = tuple(sorted(grp["idx"].unique().tolist()))
+                chave = (sala, idxs)
+                if grp["Docente"].nunique() == 1 and grp["Familia"].nunique() == 1:
+                    if chave not in unif_na_sala:
+                        unif_na_sala[chave] = {"slots": [], "grp": grp.drop_duplicates("idx")}
+                    unif_na_sala[chave]["slots"].append(slot)
+                else:
+                    if chave not in choques_sala:
+                        choques_sala[chave] = {"slots": [], "grp": grp.drop_duplicates("idx")}
+                    choques_sala[chave]["slots"].append(slot)
+
+        for (sala, _), info in choques_sala.items():
+            slots_txt = ", ".join(sorted(set(info["slots"])))
+            det = " vs ".join(
+                f"[{r['Aba']}] {r['Disciplina']} ({r['Docente']})"
+                for _, r in info["grp"].iterrows()
+            )
+            pendencias.append({
+                "Severidade": SEVERIDADE_ERRO,
+                "Código_Regra": "IR-04",
+                "Eixo": "Choque Físico de Sala",
+                "Alvo": f"{sala} ({slots_txt})",
+                "Descrição": f"Sobreposição física de espaço no mesmo horário: {det}",
+                "Ação_Recomendada": "Mover uma das turmas para sala livre do PC&T (ex.: 209B-NSA) ou outro horário.",
+            })
+
+        # Checagem de capacidade somada (IR-10) para turmas unificadas na mesma sala
+        for (sala, idxs), info in unif_na_sala.items():
+            idxs_unif_cap_checada.update(idxs)
+            sinfo = SALAS_INVENTARIO.get(sala, {"Gestao": "Externa", "Capacidade": 40, "Gargalo": "Sim"})
+            vagas_soma = int(info["grp"]["Vagas"].sum())
+            if sinfo["Capacidade"] > 0 and vagas_soma > sinfo["Capacidade"] and sala not in LAB_ROOMS:
+                det_u = " + ".join(
+                    f"[{r['Aba']}] {r['Disciplina']} ({int(r['Vagas'])}v)"
+                    for _, r in info["grp"].iterrows()
+                )
+                pendencias.append({
+                    "Severidade": SEVERIDADE_AVISO,
+                    "Código_Regra": "IR-10",
+                    "Eixo": "Capacidade de Sala",
+                    "Alvo": f"{sala} — Turma Unificada",
+                    "Descrição": f"Soma de {vagas_soma} vagas ({det_u}) excede a capacidade oficial de {sinfo['Capacidade']} lugares.",
+                    "Ação_Recomendada": "Realocar o grupo unificado para 206B-NSA (55 lug.) ou ajustar vagas no SIGAA.",
+                })
+
+    # 4. Auditoria linha a linha (IR-06 a IR-12, IR-15 e IR-16)
+    for idx, r in df_oferta.iterrows():
+        alvo = f"[{r['Aba_Origem']}] {r['Código_SIGAA']} - {r['Componente_Curricular']}"
+        slots = expandir_horario_sigaa(r["Horário_SIGAA"])
+        ch_total = int(r["CH_Total"])
+        vagas = int(r["Vagas"])
+        doc = str(r["Docente_Alocado"]).strip()
+        sala = str(r["Sala_Alocada"]).strip()
+
+        # IR-16: Aderência às Estruturas Curriculares Vigentes no SIGAA (BICT24, EMEC21, EFIS17, EFIS23)
+        info_sigaa = consultar_componente_sigaa(r["Código_SIGAA"], r["Componente_Curricular"], r.get("Curso", ""))
+        if not info_sigaa["vigente_sigaa"]:
+            pendencias.append({
+                "Severidade": SEVERIDADE_AVISO,
+                "Código_Regra": "IR-16",
+                "Eixo": "Estrutura Curricular SIGAA",
+                "Alvo": alvo,
+                "Descrição": f"Código '{r['Código_SIGAA']}' não localizado nas estruturas vigentes (BICT24, EMEC21, EFIS17, EFIS23).",
+                "Ação_Recomendada": "Conferir código vigente no Portal do Coordenador SIGAA.",
+            })
+        elif info_sigaa["ch_sigaa"] > 0 and info_sigaa["ch_sigaa"] != ch_total:
+            pendencias.append({
+                "Severidade": SEVERIDADE_AVISO,
+                "Código_Regra": "IR-16",
+                "Eixo": "Estrutura Curricular SIGAA",
+                "Alvo": alvo,
+                "Descrição": f"CH da oferta ({ch_total}h) difere da CH oficial na matriz {info_sigaa['matrizes']} ({info_sigaa['ch_sigaa']}h).",
+                "Ação_Recomendada": f"Ajustar CH para {info_sigaa['ch_sigaa']}h conforme estrutura curricular do SIGAA.",
+            })
+
+        # IR-06 / IR-07: Horário e CH
+        if len(slots) == 0:
+            pendencias.append({
+                "Severidade": SEVERIDADE_ERRO,
+                "Código_Regra": "IR-06",
+                "Eixo": "Sincronia Grade × Tabela",
+                "Alvo": alvo,
+                "Descrição": f"Componente na tabela ({ch_total}h, {doc}) sem horário definido na grade.",
+                "Ação_Recomendada": "Definir código de horário SIGAA (ex.: 24M12) no Simulador.",
+            })
+        elif len(slots) * 15 != ch_total:
+            pendencias.append({
+                "Severidade": SEVERIDADE_AVISO,
+                "Código_Regra": "IR-07",
+                "Eixo": "Consistência de CH",
+                "Alvo": alvo,
+                "Descrição": f"CH da tabela ({ch_total}h) difere dos blocos horários ({len(slots) * 15}h em {r['Horário_SIGAA']}).",
+                "Ação_Recomendada": "Confirmar se é turma condensada/intensiva ou corrigir o código SIGAA.",
+            })
+
+        # IR-08: Sem Docente
+        if eh_sem_docente(doc):
+            sugs = sugerir_docentes_habilitados(
+                r["Componente_Curricular"], df_cred, df_encargo, teto_ch=teto_ch, ch_turma=ch_total
+            )
+            txt_sug = "Sugestões habilitadas: " + " | ".join(sugs) if sugs else "Definir docente no Colegiado do PC&T."
+            pendencias.append({
+                "Severidade": SEVERIDADE_ERRO,
+                "Código_Regra": "IR-08",
+                "Eixo": "Alocação Docente",
+                "Alvo": alvo,
+                "Descrição": f"Turma de {ch_total}h ainda marcada como '{doc}'.",
+                "Ação_Recomendada": txt_sug,
+            })
+        else:
+            # IR-15: Aderência ao credenciamento (para efetivos PC&T)
+            if vinculo_map.get(doc) == "PC&T (Permanente)" and not _docente_habilitado(
+                doc, r["Componente_Curricular"], mapa_hab
+            ):
+                pendencias.append({
+                    "Severidade": SEVERIDADE_AVISO,
+                    "Código_Regra": "IR-15",
+                    "Eixo": "Credenciamento Docente",
+                    "Alvo": f"{doc} — {alvo}",
+                    "Descrição": "Componente não consta ainda na matriz PPC/Histórico cadastrada para este docente.",
+                    "Ação_Recomendada": "Confirmar decisão do Colegiado ou atualizar a matriz de credenciamento.",
+                })
+
+            # IR-11: Colaborador externo na Segunda ou Sexta
+            if vinculo_map.get(doc) == "Colaborador Externo":
+                dias = extrair_dias_sigaa(r["Horário_SIGAA"])
+                viol = [nome for cod, nome in [("2", "Segunda"), ("6", "Sexta")] if cod in dias]
+                if viol:
+                    pendencias.append({
+                        "Severidade": SEVERIDADE_AVISO,
+                        "Código_Regra": "IR-11",
+                        "Eixo": "Colaborador Externo",
+                        "Alvo": f"{doc} [{r['Aba_Origem']}]",
+                        "Descrição": f"{r['Componente_Curricular']} ({r['Horário_SIGAA']}) cai em {'/'.join(viol)}.",
+                        "Ação_Recomendada": "Preferir Terça a Quinta-feira para evitar recusa do colaborador.",
+                    })
+
+        # IR-09 / IR-10 / IR-12: Salas, lotação e gargalos de laboratório
+        sinfo = SALAS_INVENTARIO.get(sala, {"Gestao": "Externa", "Capacidade": 40, "Gargalo": "Sim"})
+        if eh_sem_sala(sala):
+            pendencias.append({
+                "Severidade": SEVERIDADE_ERRO,
+                "Código_Regra": "IR-09",
+                "Eixo": "Espaço Físico / Salas",
+                "Alvo": alvo,
+                "Descrição": f"Turma ({vagas} vagas, horário {r['Horário_SIGAA']}) está sem sala definida.",
+                "Ação_Recomendada": "Alocar em sala livre do PC&T (206B=55; 203B/207B/208B/209B=40).",
+            })
+        elif (
+            idx not in idxs_unif_cap_checada
+            and sinfo["Capacidade"] > 0
+            and vagas > sinfo["Capacidade"]
+            and sala not in LAB_ROOMS
+        ):
+            pendencias.append({
+                "Severidade": SEVERIDADE_AVISO,
+                "Código_Regra": "IR-10",
+                "Eixo": "Capacidade de Sala",
+                "Alvo": f"{sala} — {alvo}",
+                "Descrição": f"{vagas} vagas excedem a capacidade oficial de {sinfo['Capacidade']} lugares.",
+                "Ação_Recomendada": "Realocar para 206B-NSA (55 lug.) ou ajustar vagas para 40 no SIGAA.",
+            })
+
+        if sinfo.get("Gargalo") == "CRÍTICO" and not eh_sem_sala(sala):
+            pendencias.append({
+                "Severidade": SEVERIDADE_AVISO,
+                "Código_Regra": "IR-12",
+                "Eixo": "Gargalo de Laboratório",
+                "Alvo": f"{sala} [{r['Aba_Origem']}]",
+                "Descrição": f"{r['Componente_Curricular']} ({r['Horário_SIGAA']}) depende de agenda externa crítica.",
+                "Ação_Recomendada": "Confirmar reserva antecipadamente com a unidade gestora do laboratório.",
+            })
+
+    # 5. IR-13 / IR-14: Piso e Teto de Carga Horária dos 19 Efetivos PC&T
+    efetivos_df = df_encargo[df_encargo["Vínculo"] == "PC&T (Permanente)"]
+    for _, erow in efetivos_df.iterrows():
+        ch_ef = int(erow["CH_Efetiva"])
+        doc = erow["Docente"]
+        if ch_ef < piso_ch:
+            pendencias.append({
+                "Severidade": SEVERIDADE_AVISO,
+                "Código_Regra": "IR-13",
+                "Eixo": "Encargo Docente (Piso)",
+                "Alvo": doc,
+                "Descrição": f"Encargo efetivo na graduação é de {ch_ef}h (piso mínimo = {piso_ch}h; até 60h podem vir da Pós).",
+                "Ação_Recomendada": "Confirmar horas na pós-graduação/afastamento ou alocar turma pendente.",
+            })
+        elif ch_ef > teto_ch:
+            pendencias.append({
+                "Severidade": SEVERIDADE_ERRO,
+                "Código_Regra": "IR-14",
+                "Eixo": "Encargo Docente (Teto)",
+                "Alvo": doc,
+                "Descrição": f"Sobrecarga de {ch_ef}h efetivas na graduação (acima do teto de {teto_ch}h).",
+                "Ação_Recomendada": "Redistribuir uma turma para colega habilitado com saldo disponível.",
+            })
+
+    colunas_ir = ["Severidade", "Código_Regra", "Eixo", "Alvo", "Descrição", "Ação_Recomendada"]
+    if pendencias:
+        df_pendencias = (
+            pd.DataFrame(pendencias)[colunas_ir]
+            .sort_values(by=["Severidade", "Código_Regra", "Alvo"])
+            .reset_index(drop=True)
+        )
+    else:
+        df_pendencias = pd.DataFrame(columns=colunas_ir)
+
+    n_erros = int((df_pendencias["Severidade"] == SEVERIDADE_ERRO).sum()) if not df_pendencias.empty else 0
+    n_avisos = int((df_pendencias["Severidade"] == SEVERIDADE_AVISO).sum()) if not df_pendencias.empty else 0
+
+    resumo_ir = {
+        "total": len(df_pendencias),
+        "erros": n_erros,
+        "avisos": n_avisos,
+        "choques_turma": int((df_pendencias["Código_Regra"] == "IR-00").sum()) if not df_pendencias.empty else 0,
+        "choques_docente": int((df_pendencias["Código_Regra"] == "IR-03").sum()) if not df_pendencias.empty else 0,
+        "choques_sala": int((df_pendencias["Código_Regra"] == "IR-04").sum()) if not df_pendencias.empty else 0,
+        "sem_docente": int((df_pendencias["Código_Regra"] == "IR-08").sum()) if not df_pendencias.empty else 0,
+        "sem_sala": int((df_pendencias["Código_Regra"] == "IR-09").sum()) if not df_pendencias.empty else 0,
     }
+
+    return df_pendencias, df_encargo, unif_secundarias, resumo_ir
+
+
+def estilizar_malha_fina(df_pendencias: pd.DataFrame):
+    """Destaca visualmente Erros Impeditivos (vermelho) e Avisos (âmbar) na tabela IR."""
+    def _cor_sev(val):
+        s = str(val)
+        if "ERRO" in s:
+            return "background-color: #FEE2E2; color: #991B1B; font-weight: 700;"
+        return "background-color: #FEF3C7; color: #92400E; font-weight: 700;"
+
+    styler = df_pendencias.style
+    if hasattr(styler, "map"):
+        return styler.map(_cor_sev, subset=["Severidade"])
+    return styler.applymap(_cor_sev, subset=["Severidade"])
+
+
+def aplicar_edicoes_oferta(df_base: pd.DataFrame, df_editado: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    """
+    Aplica as alterações feitas no st.data_editor sobre o DataFrame completo da oferta
+    e reexecuta o enriquecimento de metadados (capacidade, gestão, slots).
+    Retorna (df_atualizado, qtd_linhas_alteradas).
+    """
+    df_novo = df_base.copy()
+    campos_editaveis = ["Docente_Alocado", "Sala_Alocada", "Horário_SIGAA", "Vagas"]
+    alteradas = 0
+
+    for idx, row in df_editado.iterrows():
+        if idx not in df_novo.index:
+            continue
+        mudou = False
+        for campo in campos_editaveis:
+            if campo not in df_editado.columns:
+                continue
+            val_orig = df_novo.loc[idx, campo]
+            val_novo = row[campo]
+
+            if campo == "Vagas":
+                val_orig_cmp = int(val_orig)
+                val_novo_cmp = int(val_novo)
+            elif campo == "Horário_SIGAA":
+                val_orig_cmp = str(val_orig).strip().upper()
+                val_novo_cmp = str(val_novo).strip().upper()
+            else:
+                val_orig_cmp = str(val_orig).strip()
+                val_novo_cmp = str(val_novo).strip()
+
+            if val_orig_cmp != val_novo_cmp:
+                df_novo.loc[idx, campo] = val_novo_cmp
+                mudou = True
+        if mudou:
+            alteradas += 1
+
+    return enriquecer_oferta(df_novo), alteradas
